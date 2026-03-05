@@ -225,10 +225,16 @@ func skipPrefixes(args []*syntax.Word) []*syntax.Word {
 			break
 		}
 		isSudo := name == "sudo" || name == "doas"
+		isEnv := name == "env"
 		args = args[1:]
-		// Skip prefix command's own flags (e.g. sudo -u root)
+		// Skip prefix command's own flags and env variable assignments
 		for len(args) > 0 {
 			val := wordValue(args[0])
+			// env accepts VAR=val assignments before the command
+			if isEnv && strings.Contains(val, "=") && !strings.HasPrefix(val, "=") {
+				args = args[1:]
+				continue
+			}
 			if !strings.HasPrefix(val, "-") || val == "-" {
 				break
 			}
