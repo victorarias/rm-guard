@@ -10,16 +10,32 @@ import (
 
 // --- Category 1: End-to-end hook protocol tests ---
 
+var testBinaryPath string
+
+func TestMain(m *testing.M) {
+	// Build the binary once for all E2E tests
+	dir, err := os.MkdirTemp("", "rm-guard-test-*")
+	if err != nil {
+		os.Exit(1)
+	}
+	defer os.RemoveAll(dir)
+
+	testBinaryPath = dir + "/rm-guard"
+	cmd := exec.Command("go", "build", "-o", testBinaryPath, ".")
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		os.Exit(1)
+	}
+
+	os.Exit(m.Run())
+}
+
 // runBinary executes the compiled rm-guard binary with the given JSON on stdin,
 // returning stdout, stderr, and exit code.
 func runBinary(t *testing.T, input string) (stdout string, stderr string, exitCode int) {
 	t.Helper()
-	binaryPath := "/tmp/rm-guard-test"
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		t.Fatalf("Binary not found at %s — build it first with: go build -o %s .", binaryPath, binaryPath)
-	}
 
-	cmd := exec.Command(binaryPath)
+	cmd := exec.Command(testBinaryPath)
 	cmd.Stdin = strings.NewReader(input)
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
