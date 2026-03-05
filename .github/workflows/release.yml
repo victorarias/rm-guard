@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          cd plugin/src
+          go test -count=1 ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cd plugin/src
+          go build -ldflags="-s -w" -o ../../rm-guard-${{ matrix.suffix }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rm-guard-${{ matrix.suffix }}
+          path: rm-guard-${{ matrix.suffix }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync plugin.json version with tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT_VERSION=$(jq -r '.version' plugin/.claude-plugin/plugin.json)
+          echo "Tag version: $VERSION"
+          echo "Current version on main: $CURRENT_VERSION"
+
+          HIGHER=$(printf '%s\n%s' "$CURRENT_VERSION" "$VERSION" | sort -V | tail -n1)
+          if [ "$HIGHER" != "$VERSION" ]; then
+            echo "::warning::Skipping version update: tag $VERSION is not >= current $CURRENT_VERSION"
+            echo "SKIP_VERSION_UPDATE=true" >> "$GITHUB_ENV"
+          else
+            cd plugin/.claude-plugin
+            jq --arg v "$VERSION" '.version = $v' plugin.json > plugin.json.tmp
+            mv plugin.json.tmp plugin.json
+            cat plugin.json
+          fi
+
+      - name: Commit version update
+        if: env.SKIP_VERSION_UPDATE != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add plugin/.claude-plugin/plugin.json
+          git diff --staged --quiet || git commit -m "chore: sync plugin.json version to ${GITHUB_REF_NAME}"
+          git push origin main
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'rm-guard-*' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          generate_release_notes: true

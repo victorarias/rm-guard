@@ -1,0 +1,8 @@
+# Binary
+plugin/bin/rm-guard
+plugin/bin/rm-guard-*
+plugin/src/rm-guard
+plugin/src/rm-guard-*
+
+# OS
+.DS_Store

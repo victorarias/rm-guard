@@ -1,0 +1,17 @@
+{
+  "name": "rm-guard",
+  "owner": {
+    "name": "Victor Arias",
+    "email": "victor@victorarias.com"
+  },
+  "metadata": {
+    "description": "Block catastrophic rm -rf commands targeting /, ~, $HOME, and user home directories"
+  },
+  "plugins": [
+    {
+      "name": "rm-guard",
+      "source": "./plugin",
+      "description": "PreToolUse hook that blocks dangerous rm -rf commands in Claude Code"
+    }
+  ]
+}
