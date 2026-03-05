@@ -1,6 +1,6 @@
 {
   "name": "rm-guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Block catastrophic rm -rf commands targeting /, ~, $HOME, and user home directories",
   "author": {
     "name": "Victor Arias"
