@@ -74,7 +74,6 @@ func TestDangerousCommands(t *testing.T) {
 
 		// After double-dash
 		{"rm -rf -- /", "after double-dash"},
-		{"rm -- -rf /", "flags after double-dash"},
 
 		// Quoted paths
 		{`rm -rf "/home/user"`, "double-quoted home"},
@@ -247,6 +246,9 @@ func TestSafeCommands(t *testing.T) {
 		{"mount /dev/sda1 /", "mount to root"},
 		{"umount /", "umount root"},
 		{"ln -s /usr/bin/foo ~/bin/foo", "symlink to home"},
+
+		// After double-dash: -rf is a filename, not flags (rm can't recurse without -r)
+		{"rm -- -rf /", "flags after double-dash are paths"},
 
 		// Path patterns in non-dangerous contexts
 		{"export PATH=$HOME/bin:$PATH", "export with home"},

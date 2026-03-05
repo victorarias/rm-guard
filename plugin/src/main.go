@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // HookInput represents the JSON input from Claude Code PreToolUse hooks
@@ -29,135 +30,381 @@ type HookSpecificOutput struct {
 	PermissionDecisionReason string `json:"permissionDecisionReason"`
 }
 
-// Patterns for detecting rm commands
-var rmCommandPattern = regexp.MustCompile(
-	`(?:^|[;&|` + "`" + `$\(\s])` + // start of string or command separator
-		`\s*` + // optional whitespace
-		`(?:\\|/usr/bin/|/bin/|command\s+|env\s+)?` + // optional prefix
-		`rm\s`, // rm followed by space
-)
-
-// Pattern for recursive+force flags
-var recursiveForcePattern = regexp.MustCompile(
-	`(?:^|\s)-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*(?:\s|$)` + // -rf, -rfa, etc
-		`|(?:^|\s)-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*(?:\s|$)` + // -fr, -fra, etc
-		`|(?:^|\s)-r\s.*-f(?:\s|$)` + // -r ... -f
-		`|(?:^|\s)-f\s.*-r(?:\s|$)` + // -f ... -r
-		`|--recursive.*--force` + // long form
-		`|--force.*--recursive`, // long form reversed
-)
-
-// Command terminators that can follow a path
-const terminator = `[\s;|&)` + "`" + `"']|$`
-
-// Dangerous path patterns
-var dangerousPathPatterns = []*regexp.Regexp{
-	// Root
-	regexp.MustCompile(`(?:^|\s)["']?/["']?(?:` + terminator + `)`), // just / (with optional quotes)
-	regexp.MustCompile(`(?:^|\s)["']?/\*`),                          // /*
-
-	// Home with tilde (bare ~ or ~/)
-	regexp.MustCompile(`(?:^|\s)["']?~/?["']?(?:` + terminator + `)`), // ~ or ~/
-	regexp.MustCompile(`(?:^|\s)["']?~/\*`),                           // ~/*
-
-	// Home with tilde and username (~root, ~nobody, etc.)
-	regexp.MustCompile(`(?:^|\s)~[a-zA-Z][a-zA-Z0-9_-]*/?(?:` + terminator + `)`),
-
-	// Home with $HOME and ${HOME}
-	regexp.MustCompile(`(?:^|\s)["']?\$\{?HOME\}?/?["']?(?:` + terminator + `)`), // $HOME or ${HOME}
-	regexp.MustCompile(`(?:^|\s)["']?\$\{?HOME\}?/\*`),                           // $HOME/* or ${HOME}/*
-
-	// User home directories (macOS and Linux) - with optional quotes
-	regexp.MustCompile(`(?:^|\s)["']?/Users/[^/\s"']+/?["']?(?:` + terminator + `)`), // /Users/username
-	regexp.MustCompile(`(?:^|\s)["']?/Users/[^/\s"']+/\*`),                           // /Users/username/*
-	regexp.MustCompile(`(?:^|\s)["']?/home/[^/\s"']+/?["']?(?:` + terminator + `)`),  // /home/username
-	regexp.MustCompile(`(?:^|\s)["']?/home/[^/\s"']+/\*`),                            // /home/username/*
-
-	// Linux root home directory
-	regexp.MustCompile(`(?:^|\s)["']?/root/?["']?(?:` + terminator + `)`), // /root
-	regexp.MustCompile(`(?:^|\s)["']?/root/\*`),                           // /root/*
-
-	// Parent traversal (conservative - any .. is suspicious with rm -rf)
-	regexp.MustCompile(`\.\.`),
+// rmCommands are names that refer to the rm binary.
+var rmCommands = map[string]bool{
+	"rm": true, "/bin/rm": true, "/usr/bin/rm": true,
 }
 
-// Pattern for shell wrappers executing rm (bash -c, sh -c, eval, etc.)
-var shellWrapperPattern = regexp.MustCompile(
-	`(?:bash|sh|zsh|fish|dash|ksh|eval)\s+` + // shell command
-		`.*` + // anything
-		`rm\s+` + // rm command
-		`[^\s]*` + // flags
-		`(?:-[rf]|--recursive|--force)`, // must have recursive or force
-)
+// prefixCommands are commands that wrap another command.
+var prefixCommands = map[string]bool{
+	"command": true, "env": true, "sudo": true,
+	"doas": true, "nohup": true, "exec": true,
+}
 
-// CheckCommand analyzes a command string and returns whether it's dangerous
-func CheckCommand(command string) (dangerous bool, reason string) {
-	// Check for shell wrappers executing rm with dangerous paths
-	if shellWrapperPattern.MatchString(command) {
-		// Check if the wrapped command targets dangerous paths
-		for _, pattern := range dangerousPathPatterns {
-			if pattern.MatchString(command) {
-				match := pattern.FindString(command)
-				return true, fmt.Sprintf("BLOCKED: shell wrapper executing rm targeting dangerous path: %s", strings.TrimSpace(match))
+// shellWrappers can execute shell code from a string argument.
+var shellWrappers = map[string]bool{
+	"bash": true, "sh": true, "zsh": true,
+	"fish": true, "dash": true, "ksh": true,
+}
+
+// wordValue extracts the effective string value from a parsed shell Word,
+// stripping quotes but preserving variable references and tildes.
+func wordValue(w *syntax.Word) string {
+	var b strings.Builder
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			b.WriteString(p.Value)
+		case *syntax.SglQuoted:
+			b.WriteString(p.Value)
+		case *syntax.DblQuoted:
+			for _, inner := range p.Parts {
+				switch ip := inner.(type) {
+				case *syntax.Lit:
+					b.WriteString(ip.Value)
+				case *syntax.ParamExp:
+					writeParamExp(&b, ip)
+				default:
+					b.WriteString("?")
+				}
 			}
+		case *syntax.ParamExp:
+			writeParamExp(&b, p)
+		default:
+			b.WriteString("?")
+		}
+	}
+	return b.String()
+}
+
+func writeParamExp(b *strings.Builder, p *syntax.ParamExp) {
+	b.WriteString("$")
+	if !p.Short {
+		b.WriteString("{")
+	}
+	b.WriteString(p.Param.Value)
+	if !p.Short {
+		b.WriteString("}")
+	}
+}
+
+// isDangerousPath checks if a path would be catastrophic to rm -rf.
+func isDangerousPath(p string) (bool, string) {
+	if p == "" {
+		return false, ""
+	}
+	cleaned := strings.TrimRight(p, "/")
+
+	// Root: / or //
+	if p == "/" || cleaned == "" {
+		return true, "/"
+	}
+	// Root glob: /*
+	if strings.HasPrefix(p, "/*") {
+		return true, "/*"
+	}
+
+	// Home via tilde: ~ or ~/
+	if cleaned == "~" {
+		return true, p
+	}
+	// Home glob: ~/*
+	if strings.HasPrefix(p, "~/*") {
+		return true, "~/*"
+	}
+
+	// Tilde with username: ~root, ~nobody (only the home dir itself)
+	if len(p) > 1 && p[0] == '~' && p[1] != '/' {
+		parts := strings.SplitN(p[1:], "/", 2)
+		if len(parts) == 1 || parts[1] == "" || parts[1] == "*" {
+			return true, "~" + parts[0]
 		}
 	}
 
-	// Check if this contains an rm command
-	if !rmCommandPattern.MatchString(command) {
-		return false, ""
+	// $HOME / ${HOME}
+	if cleaned == "$HOME" || cleaned == "${HOME}" {
+		return true, cleaned
+	}
+	if strings.HasPrefix(p, "$HOME/*") || strings.HasPrefix(p, "${HOME}/*") {
+		return true, p
 	}
 
-	// Check for recursive+force flags
-	if !recursiveForcePattern.MatchString(command) {
-		return false, ""
-	}
-
-	// Check for dangerous paths
-	for _, pattern := range dangerousPathPatterns {
-		if pattern.MatchString(command) {
-			match := pattern.FindString(command)
-			return true, fmt.Sprintf("BLOCKED: rm -rf targeting dangerous path detected: %s", strings.TrimSpace(match))
+	// /Users/<name> (macOS) - the home dir itself, not subdirectories
+	if strings.HasPrefix(cleaned, "/Users/") {
+		rest := cleaned[len("/Users/"):]
+		if rest != "" && !strings.Contains(rest, "/") {
+			return true, cleaned
 		}
+	}
+	// /Users/<name>/*
+	if strings.HasPrefix(p, "/Users/") {
+		afterPrefix := p[len("/Users/"):]
+		if parts := strings.SplitN(afterPrefix, "/", 2); len(parts) == 2 && parts[1] == "*" {
+			return true, p
+		}
+	}
+
+	// /home/<name> (Linux)
+	if strings.HasPrefix(cleaned, "/home/") {
+		rest := cleaned[len("/home/"):]
+		if rest != "" && !strings.Contains(rest, "/") {
+			return true, cleaned
+		}
+	}
+	// /home/<name>/*
+	if strings.HasPrefix(p, "/home/") {
+		afterPrefix := p[len("/home/"):]
+		if parts := strings.SplitN(afterPrefix, "/", 2); len(parts) == 2 && parts[1] == "*" {
+			return true, p
+		}
+	}
+
+	// /root
+	if cleaned == "/root" {
+		return true, "/root"
+	}
+	if strings.HasPrefix(p, "/root/*") {
+		return true, "/root/*"
+	}
+
+	// Parent traversal: any path containing ..
+	if strings.Contains(p, "..") {
+		return true, p
 	}
 
 	return false, ""
 }
 
+// parseRmFlags separates rm arguments into flags and paths,
+// returning whether recursive and force flags are present.
+func parseRmFlags(args []*syntax.Word) (recursive, force bool, paths []string) {
+	pastDash := false
+	for _, arg := range args {
+		val := wordValue(arg)
+		if val == "--" {
+			pastDash = true
+			continue
+		}
+		if !pastDash && len(val) > 1 && val[0] == '-' {
+			if strings.HasPrefix(val, "--") {
+				switch val {
+				case "--recursive":
+					recursive = true
+				case "--force":
+					force = true
+				}
+			} else {
+				flags := val[1:]
+				if strings.ContainsAny(flags, "rR") {
+					recursive = true
+				}
+				if strings.Contains(flags, "f") {
+					force = true
+				}
+			}
+		} else {
+			paths = append(paths, val)
+		}
+	}
+	return
+}
+
+// sudoFlagsWithArg are sudo flags that take a value argument.
+var sudoFlagsWithArg = map[string]bool{
+	"-u": true, "-g": true, "-C": true, "-D": true,
+	"-h": true, "-p": true, "-R": true, "-T": true,
+	"-U": true,
+}
+
+// skipPrefixes walks past prefix commands (sudo, command, env, etc.)
+// and returns the remaining args starting with the actual command.
+func skipPrefixes(args []*syntax.Word) []*syntax.Word {
+	for len(args) > 0 {
+		name := strings.TrimPrefix(wordValue(args[0]), `\`)
+		if !prefixCommands[name] {
+			break
+		}
+		isSudo := name == "sudo" || name == "doas"
+		args = args[1:]
+		// Skip prefix command's own flags (e.g. sudo -u root)
+		for len(args) > 0 {
+			val := wordValue(args[0])
+			if !strings.HasPrefix(val, "-") || val == "-" {
+				break
+			}
+			args = args[1:]
+			// Skip the value argument for flags that take one (e.g. -u root)
+			if isSudo && sudoFlagsWithArg[val] && len(args) > 0 {
+				args = args[1:]
+			}
+		}
+	}
+	return args
+}
+
+// checkRmDangerous checks if rm args contain recursive+force flags targeting dangerous paths.
+func checkRmDangerous(args []*syntax.Word) (bool, string) {
+	rec, frc, paths := parseRmFlags(args)
+	if !rec || !frc {
+		return false, ""
+	}
+	for _, p := range paths {
+		if dangerous, match := isDangerousPath(p); dangerous {
+			return true, fmt.Sprintf("BLOCKED: rm -rf targeting dangerous path detected: %s", match)
+		}
+	}
+	return false, ""
+}
+
+// CheckCommand analyzes a shell command string and returns whether it's dangerous.
+func CheckCommand(command string) (dangerous bool, reason string) {
+	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(command), "")
+	if err != nil {
+		return false, "" // fail open
+	}
+
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if dangerous {
+			return false
+		}
+
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+
+		args := skipPrefixes(call.Args)
+		if len(args) == 0 {
+			return true
+		}
+
+		cmdName := strings.TrimPrefix(wordValue(args[0]), `\`)
+
+		// Shell wrappers: bash -c '...', eval '...'
+		if cmdName == "eval" {
+			var parts []string
+			for _, a := range args[1:] {
+				parts = append(parts, wordValue(a))
+			}
+			if inner := strings.Join(parts, " "); inner != "" {
+				if d, r := CheckCommand(inner); d {
+					dangerous, reason = true, r
+				}
+			}
+			return true
+		}
+		if shellWrappers[cmdName] {
+			for i := 1; i < len(args); i++ {
+				if wordValue(args[i]) == "-c" && i+1 < len(args) {
+					if d, r := CheckCommand(wordValue(args[i+1])); d {
+						dangerous, reason = true, r
+					}
+					break
+				}
+			}
+			return true
+		}
+
+		// find -exec rm
+		if cmdName == "find" {
+			// Collect find's search paths (args before first flag)
+			var findPaths []string
+			for _, a := range args[1:] {
+				v := wordValue(a)
+				if strings.HasPrefix(v, "-") || v == "!" || v == "(" {
+					break
+				}
+				findPaths = append(findPaths, v)
+			}
+			for i := 1; i < len(args); i++ {
+				v := wordValue(args[i])
+				if v != "-exec" && v != "-execdir" {
+					continue
+				}
+				// Collect exec args until terminator
+				var execArgs []*syntax.Word
+				for j := i + 1; j < len(args); j++ {
+					ev := wordValue(args[j])
+					if ev == ";" || ev == `\;` || ev == "+" {
+						break
+					}
+					execArgs = append(execArgs, args[j])
+				}
+				if len(execArgs) == 0 {
+					continue
+				}
+				execName := strings.TrimPrefix(wordValue(execArgs[0]), `\`)
+				if !rmCommands[execName] {
+					continue
+				}
+				rec, frc, execPaths := parseRmFlags(execArgs[1:])
+				if !rec || !frc {
+					continue
+				}
+				// Check exec path args
+				for _, p := range execPaths {
+					if d, m := isDangerousPath(p); d {
+						dangerous, reason = true, fmt.Sprintf("BLOCKED: rm -rf targeting dangerous path detected: %s", m)
+						return false
+					}
+				}
+				// Check find's search paths (rm -rf from a dangerous root)
+				for _, p := range findPaths {
+					if d, m := isDangerousPath(p); d {
+						dangerous, reason = true, fmt.Sprintf("BLOCKED: find with rm -rf from dangerous path: %s", m)
+						return false
+					}
+				}
+			}
+			return true
+		}
+
+		// xargs rm
+		if cmdName == "xargs" {
+			rest := args[1:]
+			// Skip xargs flags
+			for len(rest) > 0 && strings.HasPrefix(wordValue(rest[0]), "-") {
+				rest = rest[1:]
+			}
+			if len(rest) > 0 && rmCommands[strings.TrimPrefix(wordValue(rest[0]), `\`)] {
+				if d, r := checkRmDangerous(rest[1:]); d {
+					dangerous, reason = true, r
+					return false
+				}
+			}
+			return true
+		}
+
+		// Direct rm command
+		if !rmCommands[cmdName] {
+			return true
+		}
+		if d, r := checkRmDangerous(args[1:]); d {
+			dangerous, reason = true, r
+		}
+		return true
+	})
+
+	return
+}
+
 func main() {
-	// Read JSON input from stdin
 	var input HookInput
-	decoder := json.NewDecoder(os.Stdin)
-	if err := decoder.Decode(&input); err != nil {
-		// If we can't parse input, allow the command (fail open)
+	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
 		os.Exit(0)
 	}
-
-	// Only check Bash commands
-	if input.ToolName != "Bash" {
+	if input.ToolName != "Bash" || input.ToolInput.Command == "" {
 		os.Exit(0)
 	}
-
-	command := input.ToolInput.Command
-	if command == "" {
-		os.Exit(0)
-	}
-
-	// Check if command is dangerous
-	dangerous, reason := CheckCommand(command)
+	dangerous, reason := CheckCommand(input.ToolInput.Command)
 	if !dangerous {
 		os.Exit(0)
 	}
-
-	// Output deny response
-	output := HookOutput{
+	json.NewEncoder(os.Stdout).Encode(HookOutput{
 		HookSpecificOutput: HookSpecificOutput{
 			HookEventName:            "PreToolUse",
 			PermissionDecision:       "deny",
 			PermissionDecisionReason: reason,
 		},
-	}
-
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.Encode(output)
+	})
 }
